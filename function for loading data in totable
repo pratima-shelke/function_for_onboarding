@@ -1,0 +1,135 @@
+import boto3
+import json
+from datetime import datetime
+import psycopg2
+from botocore.exceptions import ClientError
+import bcrypt
+
+def lambda_handler(event, context):
+    # Extract data from the event
+    data =event['body']
+    print("data:-",data)
+    
+    # Prepare the item to be inserted into the table
+    item = {
+        'name': data['name'],
+        'company': data['company'],
+        'email_id': data['email'],
+        'address': data['address'],
+        'city': data['city'],
+        'state': data['State'],
+        'country': data['Country'],
+        'postalcode': data['postalcode'],
+        'phonenumber': data['phonenumber'],
+        'timezone': data['timezone'],
+        'profilepicture': data.get('profilepicture'),  # Get profile picture or None if not provided
+        'language': data['language'],
+        'created_at': datetime.now(),  # Use datetime object directly
+        'is_active': data['IsActive']
+    }
+    
+    try:
+        # Connect to PostgreSQL database
+        conn = psycopg2.connect(
+            dbname='postgres',
+            user='postgres',
+            password='Teqfocus',
+            host='postgres-1.cj0cmuwa694k.ap-south-1.rds.amazonaws.com',
+            port='5432'
+        )
+        cursor = conn.cursor()
+        
+        # Insert data into the existing table without the 'id' field
+        insert_query = """
+            INSERT INTO public.customer_onboarding (
+                name, company, email_id, address, city, state, country, postalcode,
+                phonenumber, timezone, profilepicture, language, created_at, is_active, token_assigned
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+        """
+        cursor.execute(insert_query, (
+            item['name'], item['company'], item['email_id'], item['address'], item['city'],
+            item['state'], item['country'], item['postalcode'], item['phonenumber'], item['timezone'],
+            item['profilepicture'], item['language'], item['created_at'],
+            item['is_active'], 1000  # Assign 1000 tokens to every user
+        ))
+        
+        # Fetch the last inserted ID from customer_onboarding table
+        last_inserted_id = cursor.fetchone()[0]
+        
+        # Insert data into the users table with hashed password
+        insert_users_query = """
+            INSERT INTO public.users (
+                customer_onboarding_id, user_name, email_id, password, role,
+                is_active, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """
+        # Hash the password before inserting
+        hashed_password = bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt())
+        print("hashed_password:-",hashed_password)
+        
+        # # Insert data into the users table with hashed password
+        # cursor.execute(insert_users_query, (
+        #     last_inserted_id, data['name'], data['email'],
+        #     hashed_password.decode('utf-8'), data.get('role', ''),
+        #     data['IsActive'], datetime.now()
+        # ))
+        
+        # Insert data into the users table without hashing the password
+        cursor.execute(insert_users_query, (
+            last_inserted_id, data['name'], data['email'],
+            data['password'], data.get('role', ''),
+            data['IsActive'], datetime.now()
+        ))
+
+
+        # Commit the transaction
+        conn.commit()
+        
+        # Close the cursor and connection
+        cursor.close()
+        conn.close()
+        
+        # Create an S3 bucket with the user's name and current date
+        s3 = boto3.client('s3')
+        region = 'ap-south-1'  # Update with your desired region
+        current_date = datetime.now().strftime("%Y%m%d")
+        bucket_name = f"{data['company'].lower().replace(' ', '-').replace('.', '').replace('_', '')}-{current_date}"
+        print("bucket_name:",bucket_name)
+
+        # Check if the bucket already exists
+        try:
+            s3.head_bucket(Bucket=bucket_name)
+            # Bucket already exists
+            return {
+                'statusCode': 200,
+                'body': json.dumps({'message': 'Data inserted successfully and bucket already exists'})
+            }
+            
+        except ClientError as e:
+            # If bucket does not exist, attempt to create it
+            if e.response['Error']['Code'] == '404':
+                s3.create_bucket(Bucket=bucket_name, ACL='private', CreateBucketConfiguration={'LocationConstraint': region})
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps({'message': 'Data inserted successfully and bucket created'})
+                }
+            else:
+                # Other S3 bucket error
+                print("Error: Unable to create or check S3 bucket:", e)
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps({'message': 'Error creating or checking S3 bucket'})
+                }
+        
+    except psycopg2.Error as e:
+        print("Error: Unable to interact with PostgreSQL:", e)
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'message': 'Error interacting with PostgreSQL'})
+        }
+    except ClientError as e:
+        print("Error: Unable to create S3 bucket:", e)
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'message': 'Error creating S3 bucket'})
+        }
